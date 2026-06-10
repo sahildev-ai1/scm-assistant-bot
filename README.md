@@ -1,7 +1,7 @@
 # SCM Assistant — Supply Chain RAG Chatbot
 
 > **Trinamix Hiring Task TX-JrAI-003** | Junior AI Engineer
-
+> https://scm-assistant-bot-1ex0.onrender.com
 ## 🔗 Public Chatbot URL
 ```
 https://scm-assistant.onrender.com
