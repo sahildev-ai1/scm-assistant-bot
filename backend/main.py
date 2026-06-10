@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 OLLAMA_API_KEY  = os.getenv("OLLAMA_API_KEY", "").strip()
 OLLAMA_HOST     = os.getenv("OLLAMA_HOST", "").strip().rstrip("/")
 _OLLAMA_BASE    = OLLAMA_HOST if OLLAMA_HOST else "https://ollama.com"
-OLLAMA_CHAT_URL = f"{_OLLAMA_BASE}/api/chat"   # only endpoint that exists on Ollama Cloud
+OLLAMA_CHAT_URL = f"{_OLLAMA_BASE}/api/chat"
 
 CHAT_MODEL  = os.getenv("CHAT_MODEL",  "gemma4:31b-cloud")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "gemma4:31b-cloud")
@@ -39,8 +39,9 @@ QDRANT_URL      = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY", "")
 COLLECTION_NAME = "scm_docs"
 
-# Dimension is discovered at startup by probing the model once — see _detect_embed_dim()
-EMBED_DIM: int = 0   # set by startup event
+# Fixed at 256 — the embed prompt asks for exactly 256 floats.
+# DO NOT auto-detect at startup (causes race condition on Render cold boot).
+EMBED_DIM = 256
 
 # ─────────────────── AUTH ───────────────────
 def _headers() -> dict:
@@ -49,11 +50,54 @@ def _headers() -> dict:
         h["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
     return h
 
+# ─────────────────── QDRANT CLIENT ───────────────────
+_qclient: Optional[QdrantClient] = None
+
+def get_qdrant() -> QdrantClient:
+    global _qclient
+    if _qclient is None:
+        if QDRANT_URL and QDRANT_API_KEY:
+            _qclient = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        else:
+            _qclient = QdrantClient(":memory:")
+    return _qclient
+
+
+def _ensure_collection():
+    """
+    Create collection if missing.
+    If it exists with wrong dim — delete and recreate.
+    Called lazily on first ingest/chat, NOT at startup.
+    """
+    client = get_qdrant()
+    existing = {c.name for c in client.get_collections().collections}
+
+    if COLLECTION_NAME in existing:
+        info = client.get_collection(COLLECTION_NAME)
+        stored_dim = info.config.params.vectors.size
+        if stored_dim == EMBED_DIM:
+            log.info("Collection '%s' OK (dim=%d)", COLLECTION_NAME, EMBED_DIM)
+            return
+        log.warning(
+            "Collection '%s' dim=%d != EMBED_DIM=%d — recreating.",
+            COLLECTION_NAME, stored_dim, EMBED_DIM
+        )
+        client.delete_collection(COLLECTION_NAME)
+
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+    )
+    log.info("Created collection '%s' dim=%d", COLLECTION_NAME, EMBED_DIM)
+
+
 # ─────────────────── EMBED VIA CHAT ───────────────────
-_EMBED_SYSTEM = """You are a semantic embedding engine.
-When given text, respond with ONLY a valid JSON array of floating-point numbers
-between -1.0 and 1.0 that represent the semantic meaning of the input.
-Output exactly 256 numbers. No explanation, no markdown, no extra text — ONLY the JSON array."""
+_EMBED_SYSTEM = (
+    f"You are an embedding engine. "
+    f"When given text, respond with ONLY a JSON array of exactly {EMBED_DIM} "
+    f"floating-point numbers between -1.0 and 1.0 representing the semantic meaning. "
+    f"No explanation, no markdown — ONLY the JSON array."
+)
 
 def _embed_one(text: str) -> list[float]:
     body = {
@@ -79,7 +123,6 @@ def _embed_one(text: str) -> list[float]:
 
     raw = r.json().get("message", {}).get("content", "[]")
 
-    # Robust parse — handle markdown fences, wrapped dicts, etc.
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -87,9 +130,20 @@ def _embed_one(text: str) -> list[float]:
         parsed = json.loads(m.group()) if m else []
 
     if isinstance(parsed, dict):
-        parsed = parsed.get("embedding") or parsed.get("values") or list(parsed.values())[0]
+        parsed = (
+            parsed.get("embedding")
+            or parsed.get("values")
+            or parsed.get("vector")
+            or list(parsed.values())[0]
+        )
 
     vec = [float(v) for v in parsed]
+
+    # Pad or trim to exactly EMBED_DIM
+    if len(vec) < EMBED_DIM:
+        vec.extend([0.0] * (EMBED_DIM - len(vec)))
+    elif len(vec) > EMBED_DIM:
+        vec = vec[:EMBED_DIM]
 
     # L2-normalise
     norm = sum(x * x for x in vec) ** 0.5
@@ -99,75 +153,12 @@ def _embed_one(text: str) -> list[float]:
     return vec
 
 
-def _detect_embed_dim() -> int:
-    """Probe the model once with a short text and return the actual vector length."""
-    log.info("Probing embedding dimension from model '%s'…", EMBED_MODEL)
-    try:
-        vec = _embed_one("hello world")
-        dim = len(vec)
-        log.info("Detected embedding dimension: %d", dim)
-        return dim
-    except Exception as e:
-        log.warning("Could not detect embed dim (%s) — defaulting to 256", e)
-        return 256
-
-
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    vecs = []
-    for t in texts:
-        v = _embed_one(t)
-        # Pad or trim to match the collection's fixed EMBED_DIM
-        if len(v) < EMBED_DIM:
-            v.extend([0.0] * (EMBED_DIM - len(v)))
-        elif len(v) > EMBED_DIM:
-            v = v[:EMBED_DIM]
-        vecs.append(v)
-    return vecs
+    return [_embed_one(t) for t in texts]
 
 
 def embed_query(text: str) -> list[float]:
-    return embed_texts([text])[0]
-
-
-# ─────────────────── QDRANT CLIENT ───────────────────
-_qclient: Optional[QdrantClient] = None
-
-def get_qdrant() -> QdrantClient:
-    global _qclient
-    if _qclient is None:
-        if QDRANT_URL and QDRANT_API_KEY:
-            _qclient = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-        else:
-            _qclient = QdrantClient(":memory:")
-    return _qclient
-
-
-def _ensure_collection(client: QdrantClient):
-    """
-    Create collection if it doesn't exist.
-    If it exists with a DIFFERENT dimension, delete and recreate it.
-    This prevents the Qdrant 400 Bad Request on upsert.
-    """
-    existing = {c.name: c for c in client.get_collections().collections}
-    if COLLECTION_NAME in existing:
-        # Check if the stored dim matches our current EMBED_DIM
-        info = client.get_collection(COLLECTION_NAME)
-        stored_dim = info.config.params.vectors.size
-        if stored_dim != EMBED_DIM:
-            log.warning(
-                "Collection '%s' has dim=%d but model produces dim=%d — recreating.",
-                COLLECTION_NAME, stored_dim, EMBED_DIM
-            )
-            client.delete_collection(COLLECTION_NAME)
-        else:
-            log.info("Collection '%s' exists with correct dim=%d", COLLECTION_NAME, EMBED_DIM)
-            return
-
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
-    )
-    log.info("Created Qdrant collection '%s' dim=%d", COLLECTION_NAME, EMBED_DIM)
+    return _embed_one(text)
 
 
 # ─────────────────── CHUNKING ───────────────────
@@ -202,19 +193,26 @@ def csv_to_chunks(df: pd.DataFrame, chunk_rows: int = 20) -> list[dict]:
         })
     return chunks
 
+
 # ─────────────────── INGEST ───────────────────
-def upsert_chunks(chunks: list[dict], source_tag: str, client: QdrantClient) -> int:
-    total = 0
+def upsert_chunks(chunks: list[dict], source_tag: str) -> int:
+    client = get_qdrant()
+    total  = 0
     for i, chunk in enumerate(chunks):
-        vec = embed_texts([chunk["text"]])[0]
+        vec = _embed_one(chunk["text"])
         uid = int(hashlib.md5(f"{source_tag}{i}".encode()).hexdigest(), 16) % (10**12)
         client.upsert(
             collection_name=COLLECTION_NAME,
-            points=[PointStruct(id=uid, vector=vec, payload={**chunk, "source_tag": source_tag})],
+            points=[PointStruct(
+                id=uid,
+                vector=vec,
+                payload={**chunk, "source_tag": source_tag},
+            )],
         )
         total += 1
         log.info("Embedded chunk %d/%d  [%s]", i + 1, len(chunks), source_tag)
     return total
+
 
 # ─────────────────── RETRIEVAL ───────────────────
 def retrieve(query: str, top_k: int = 6) -> list[str]:
@@ -226,6 +224,7 @@ def retrieve(query: str, top_k: int = 6) -> list[str]:
         with_payload=True,
     )
     return [h.payload.get("text", "") for h in hits]
+
 
 # ─────────────────── LLM CHAT ───────────────────
 SYSTEM_PROMPT = """You are SCM Assistant, an expert supply chain analyst for BQBYTE Technologies.
@@ -251,8 +250,9 @@ def llm_chat(query: str, context_chunks: list[str]) -> str:
     r.raise_for_status()
     return r.json().get("message", {}).get("content", "No response.")
 
+
 # ─────────────────── FASTAPI ───────────────────
-app = FastAPI(title="SCM Assistant API", version="1.3")
+app = FastAPI(title="SCM Assistant API", version="1.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -263,19 +263,6 @@ ingest_status = {
     "pdf":  {"status": "idle", "chunks": 0, "message": ""},
     "total_chunks": 0,
 }
-
-
-@app.on_event("startup")
-async def startup():
-    """
-    On startup:
-    1. Probe the model to find the real embedding dimension.
-    2. Ensure the Qdrant collection matches that dimension (recreate if not).
-    """
-    global EMBED_DIM
-    EMBED_DIM = _detect_embed_dim()
-    _ensure_collection(get_qdrant())
-    log.info("SCM Assistant ready. embed_dim=%d  chat_url=%s", EMBED_DIM, OLLAMA_CHAT_URL)
 
 
 @app.get("/health")
@@ -307,7 +294,8 @@ async def ingest_csv(file: UploadFile = File(...), chunk_rows: int = 20):
         ingest_status["csv"]["message"] = f"Loaded {len(df)} rows. Chunking…"
         chunks = csv_to_chunks(df, chunk_rows=chunk_rows)
         ingest_status["csv"]["message"] = f"{len(chunks)} chunks. Embedding…"
-        n = upsert_chunks(chunks, "csv", get_qdrant())
+        _ensure_collection()           # create/fix collection right before upsert
+        n = upsert_chunks(chunks, "csv")
         ingest_status["csv"] = {"status": "done", "chunks": n, "message": f"✓ {n} chunks"}
         ingest_status["total_chunks"] = ingest_status["csv"]["chunks"] + ingest_status["pdf"]["chunks"]
         return {"ok": True, "chunks_upserted": n, "rows": len(df)}
@@ -327,7 +315,8 @@ async def ingest_pdf(file: UploadFile = File(...), chunk_size: int = 400, overla
         doc.close()
         chunks = [{"text": c, "source": "pdf"} for c in chunk_text(text, chunk_size, overlap)]
         ingest_status["pdf"]["message"] = f"{len(chunks)} chunks. Embedding…"
-        n = upsert_chunks(chunks, "pdf", get_qdrant())
+        _ensure_collection()           # create/fix collection right before upsert
+        n = upsert_chunks(chunks, "pdf")
         ingest_status["pdf"] = {"status": "done", "chunks": n, "message": f"✓ {n} chunks"}
         ingest_status["total_chunks"] = ingest_status["csv"]["chunks"] + ingest_status["pdf"]["chunks"]
         return {"ok": True, "chunks_upserted": n}
@@ -351,11 +340,15 @@ def chat(req: ChatRequest):
     return {"answer": answer, "sources_used": len(chunks), "latency_s": round(time.time()-t0, 2)}
 
 
-@app.delete("/collection/reset")
+@app.post("/collection/reset")
 def reset_collection():
+    """POST instead of DELETE — works on all proxies including Render."""
     client = get_qdrant()
-    client.delete_collection(COLLECTION_NAME)
-    _ensure_collection(client)
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass   # already gone — that's fine
+    _ensure_collection()
     ingest_status["csv"]  = {"status": "idle", "chunks": 0, "message": ""}
     ingest_status["pdf"]  = {"status": "idle", "chunks": 0, "message": ""}
     ingest_status["total_chunks"] = 0
