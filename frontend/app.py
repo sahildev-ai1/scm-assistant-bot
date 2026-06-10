@@ -12,6 +12,45 @@ import requests
 import streamlit as st
 import pandas as pd
 
+# ─────────────────── LOCALSTORAGE BRIDGE ───────────────────
+import json as _json
+
+def _save_history_to_browser(messages: list):
+    """Inject JS to save chat history to localStorage."""
+    safe = _json.dumps(messages)
+    st.components.v1.html(f"""
+    <script>
+      try {{
+        localStorage.setItem('scm_chat_history', {safe!r});
+      }} catch(e) {{}}
+    </script>
+    """, height=0)
+
+def _load_history_from_browser():
+    """
+    Render a tiny JS snippet that reads localStorage and writes it into
+    a hidden Streamlit text element via postMessage.
+    We use a query-param trick: on first load we inject JS that appends
+    ?_hist=<encoded> to the URL, which causes Streamlit to reload with
+    the data available in st.query_params.
+    """
+    st.components.v1.html("""
+    <script>
+      (function() {
+        const key = 'scm_chat_history';
+        const existing = new URLSearchParams(window.location.search).get('_hist');
+        if (existing) return;   // already loaded this session
+        const raw = localStorage.getItem(key);
+        if (!raw) return;
+        // Write into query param so Streamlit can read it
+        const url = new URL(window.location.href);
+        url.searchParams.set('_hist', encodeURIComponent(raw));
+        window.location.replace(url.toString());
+      })();
+    </script>
+    """, height=0)
+
+
 # ─────────────────── CONFIG ───────────────────
 API_BASE = "http://localhost:8000"   # FastAPI on same dyno
 
@@ -203,17 +242,22 @@ def api_get(path: str):
     except Exception as e:
         return None, str(e)
 
-def api_post(path: str, **kwargs):
+def api_post(path: str, timeout: int = 300, **kwargs):
+    # /chat needs a long timeout — Ollama Cloud gemma4:31b can take 2-4 min
     try:
-        r = requests.post(f"{API_BASE}{path}", timeout=180, **kwargs)
+        r = requests.post(f"{API_BASE}{path}", timeout=timeout, **kwargs)
         r.raise_for_status()
         return r.json(), None
+    except requests.Timeout:
+        return None, f"Request timed out after {timeout}s — Ollama Cloud may be slow, try again."
     except Exception as e:
-        err = ""
+        err = str(e)
         try:
-            err = e.response.json().get("detail", str(e))
+            detail = e.response.json().get("detail", "")
+            if detail:
+                err = detail
         except Exception:
-            err = str(e)
+            pass
         return None, err
 
 def status_badge(s: str) -> str:
@@ -424,9 +468,22 @@ with tab1:
 with tab2:
     st.markdown("## 💬 Supply Chain Chatbot")
 
-    # Init chat history
+    # ── Load history from localStorage on first load ──
+    _load_history_from_browser()   # injects JS; on 2nd load populates ?_hist=
+
     if "messages" not in st.session_state:
-        st.session_state.messages = []
+        # Try to restore from query param (set by the JS bridge above)
+        raw_hist = st.query_params.get("_hist", "")
+        if raw_hist:
+            try:
+                import urllib.parse as _up
+                st.session_state.messages = _json.loads(_up.unquote(raw_hist))
+                # Clean the URL so reloads don't re-inject
+                st.query_params.clear()
+            except Exception:
+                st.session_state.messages = []
+        else:
+            st.session_state.messages = []
 
     # Sample questions
     st.markdown("### 📋 Sample Questions")
@@ -446,20 +503,7 @@ with tab2:
 
     st.markdown("---")
 
-    # Chat history display
-    chat_container = st.container()
-    with chat_container:
-        for msg in st.session_state.messages:
-            if msg["role"] == "user":
-                st.markdown(f'<div class="user-bubble">👤 <strong>You</strong><br>{msg["content"]}</div>',
-                            unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="bot-bubble">🤖 <strong>SCM Assistant</strong><br>{msg["content"]}</div>',
-                            unsafe_allow_html=True)
-                if msg.get("meta"):
-                    st.markdown(f'<div class="meta-tag">{msg["meta"]}</div>', unsafe_allow_html=True)
-
-    # Input
+    # Input FIRST — so the key is registered before we read session state below
     question = st.text_input(
         "Ask a question about your supply chain…",
         value=st.session_state.pop("pending_q", ""),
@@ -467,18 +511,43 @@ with tab2:
         placeholder="e.g. Which suppliers have active disruption flags?",
     )
 
+    # Chat history — rendered after input so it always shows latest messages
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            st.markdown(f'<div class="user-bubble">👤 <strong>You</strong><br>{msg["content"]}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="bot-bubble">🤖 <strong>SCM Assistant</strong><br>{msg["content"]}</div>',
+                        unsafe_allow_html=True)
+            if msg.get("meta"):
+                st.markdown(f'<div class="meta-tag">{msg["meta"]}</div>', unsafe_allow_html=True)
+
     col_send, col_clear = st.columns([4, 1])
     send_btn  = col_send.button("Send ➤", key="send_btn")
     clear_btn = col_clear.button("Clear", key="clear_btn")
 
     if clear_btn:
         st.session_state.messages = []
+        st.components.v1.html("""
+        <script>
+          try { localStorage.removeItem('scm_chat_history'); } catch(e) {}
+          // Also strip query param
+          const url = new URL(window.location.href);
+          url.searchParams.delete('_hist');
+          window.history.replaceState({}, '', url.toString());
+        </script>
+        """, height=0)
         st.rerun()
 
     if send_btn and question.strip():
+        # Store question immediately, clear input via flag
         st.session_state.messages.append({"role": "user", "content": question})
-        with st.spinner("Retrieving context and generating answer…"):
-            result, err = api_post("/chat", json={"question": question, "top_k": 6})
+        st.session_state["_last_q"] = question
+
+        # Show spinner and call API — do NOT rerun until after storing the answer
+        with st.spinner("⏳ Querying Ollama Cloud… (may take 30-90s for gemma4:31b)"):
+            result, err = api_post("/chat", timeout=360, json={"question": question, "top_k": 6})
+
         if result:
             meta = f"⏱ {result['latency_s']}s · {result['sources_used']} chunks retrieved"
             st.session_state.messages.append({
@@ -491,6 +560,9 @@ with tab2:
                 "role": "assistant",
                 "content": f"⚠️ Error: {err}",
             })
+        # Persist to browser localStorage before rerun
+        _save_history_to_browser(st.session_state.messages)
+        # Only rerun AFTER answer is stored — this re-renders chat history
         st.rerun()
 
 
