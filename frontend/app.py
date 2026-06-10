@@ -535,7 +535,12 @@ with tab2:
         _clear_ls()
         st.rerun()
 
-    if send_btn and question.strip():
+    if send_btn:
+        # Always read from session_state — the local `question` variable is stale
+        # on re-run (st.text_input resets it to "" before this handler fires).
+        question = st.session_state.get("chat_input", "").strip()
+
+    if send_btn and question:
         # Store question immediately, clear input via flag
         st.session_state.messages.append({"role": "user", "content": question})
         st.session_state["_last_q"] = question
