@@ -17,4 +17,4 @@ services:
       - key: CHAT_MODEL
         value: llama3.2
       - key: PYTHON_VERSION
-        value: "3.11.0"
+        value: "3.11.9"
