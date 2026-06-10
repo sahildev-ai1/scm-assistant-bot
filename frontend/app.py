@@ -10,45 +10,49 @@ Tabs:
 import time
 import requests
 import streamlit as st
+import streamlit.components.v1 as _components
 import pandas as pd
 
 # ─────────────────── LOCALSTORAGE BRIDGE ───────────────────
 import json as _json
 
-def _save_history_to_browser(messages: list):
-    """Inject JS to save chat history to localStorage."""
-    safe = _json.dumps(messages)
-    st.components.v1.html(f"""
+# localStorage key
+_LS_KEY = "scm_chat_history"
+
+def _save_to_ls(messages: list):
+    """Write chat history to browser localStorage via injected JS."""
+    payload = _json.dumps(messages, ensure_ascii=True)
+    # Use single quotes around the JSON string so double-quotes inside don't break JS
+    js = f"try{{localStorage.setItem('{_LS_KEY}', JSON.stringify({payload}));}}catch(e){{}}"
+    _components.html(f"<script>{js}</script>", height=0)
+
+def _clear_ls():
+    """Remove chat history from localStorage."""
+    _components.html(
+        f"<script>try{{localStorage.removeItem('{_LS_KEY}');}}catch(e){{}}</script>",
+        height=0,
+    )
+
+def _inject_ls_loader():
+    """
+    On first render: read localStorage and push it into ?_hist= query param,
+    triggering a Streamlit reload that populates session_state.
+    Guard: skip if ?_hist already present (already loaded this session).
+    """
+    _components.html(f"""
     <script>
-      try {{
-        localStorage.setItem('scm_chat_history', {safe!r});
-      }} catch(e) {{}}
+    (function(){{
+      if (new URLSearchParams(window.location.search).get('_hist')) return;
+      var raw = null;
+      try {{ raw = localStorage.getItem('{_LS_KEY}'); }} catch(e) {{}}
+      if (!raw) return;
+      var url = new URL(window.location.href);
+      url.searchParams.set('_hist', encodeURIComponent(raw));
+      window.location.replace(url.toString());
+    }})();
     </script>
     """, height=0)
 
-def _load_history_from_browser():
-    """
-    Render a tiny JS snippet that reads localStorage and writes it into
-    a hidden Streamlit text element via postMessage.
-    We use a query-param trick: on first load we inject JS that appends
-    ?_hist=<encoded> to the URL, which causes Streamlit to reload with
-    the data available in st.query_params.
-    """
-    st.components.v1.html("""
-    <script>
-      (function() {
-        const key = 'scm_chat_history';
-        const existing = new URLSearchParams(window.location.search).get('_hist');
-        if (existing) return;   // already loaded this session
-        const raw = localStorage.getItem(key);
-        if (!raw) return;
-        // Write into query param so Streamlit can read it
-        const url = new URL(window.location.href);
-        url.searchParams.set('_hist', encodeURIComponent(raw));
-        window.location.replace(url.toString());
-      })();
-    </script>
-    """, height=0)
 
 
 # ─────────────────── CONFIG ───────────────────
@@ -469,7 +473,7 @@ with tab2:
     st.markdown("## 💬 Supply Chain Chatbot")
 
     # ── Load history from localStorage on first load ──
-    _load_history_from_browser()   # injects JS; on 2nd load populates ?_hist=
+    _inject_ls_loader()   # injects JS; on reload populates ?_hist= query param
 
     if "messages" not in st.session_state:
         # Try to restore from query param (set by the JS bridge above)
@@ -528,15 +532,7 @@ with tab2:
 
     if clear_btn:
         st.session_state.messages = []
-        st.components.v1.html("""
-        <script>
-          try { localStorage.removeItem('scm_chat_history'); } catch(e) {}
-          // Also strip query param
-          const url = new URL(window.location.href);
-          url.searchParams.delete('_hist');
-          window.history.replaceState({}, '', url.toString());
-        </script>
-        """, height=0)
+        _clear_ls()
         st.rerun()
 
     if send_btn and question.strip():
@@ -561,7 +557,7 @@ with tab2:
                 "content": f"⚠️ Error: {err}",
             })
         # Persist to browser localStorage before rerun
-        _save_history_to_browser(st.session_state.messages)
+        _save_to_ls(st.session_state.messages)
         # Only rerun AFTER answer is stored — this re-renders chat history
         st.rerun()
 
