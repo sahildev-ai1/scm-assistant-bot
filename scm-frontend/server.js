@@ -4,12 +4,16 @@ const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.static(path.join(__dirname, "public")));
+// Works whether files are flat or nested — always resolves relative to this file
+const publicDir = path.join(__dirname, "public");
 
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+app.use(express.static(publicDir));
+
+app.get("*", (req, res) => {
+  res.sendFile(path.join(publicDir, "index.html"));
 });
 
 app.listen(PORT, () => {
   console.log(`SCM Frontend running on port ${PORT}`);
+  console.log(`Serving static files from: ${publicDir}`);
 });
