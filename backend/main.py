@@ -99,7 +99,17 @@ _EMBED_SYSTEM = (
     f"No explanation, no markdown — ONLY the JSON array."
 )
 
-def _embed_one(text: str) -> list[float]:
+import time as _time
+
+def _embed_one(text: str, retries: int = 5) -> list[float]:
+    """
+    Call Ollama Cloud chat API to get embeddings.
+    Retries up to `retries` times with exponential backoff on:
+      - 429 (rate limit)
+      - 503 / 502 (server overload)
+      - Timeout
+      - Bad JSON / empty vector
+    """
     body = {
         "model":  EMBED_MODEL,
         "stream": False,
@@ -114,43 +124,73 @@ def _embed_one(text: str) -> list[float]:
             "num_predict": 4096,
         },
     }
-    r = requests.post(OLLAMA_CHAT_URL, json=body, headers=_headers(), timeout=90)
-    if r.status_code == 401:
-        raise RuntimeError("Ollama 401 Unauthorized — check OLLAMA_API_KEY")
-    if r.status_code == 404:
-        raise RuntimeError(f"Model '{EMBED_MODEL}' not found on Ollama Cloud")
-    r.raise_for_status()
 
-    raw = r.json().get("message", {}).get("content", "[]")
+    last_err = None
+    for attempt in range(retries):
+        wait = 2 ** attempt          # 1s, 2s, 4s, 8s, 16s
+        try:
+            r = requests.post(OLLAMA_CHAT_URL, json=body, headers=_headers(), timeout=120)
 
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r'\[.*\]', raw, re.DOTALL)
-        parsed = json.loads(m.group()) if m else []
+            if r.status_code == 401:
+                raise RuntimeError("Ollama 401 Unauthorized — check OLLAMA_API_KEY")
+            if r.status_code == 404:
+                raise RuntimeError(f"Model '{EMBED_MODEL}' not found on Ollama Cloud")
+            if r.status_code in (429, 502, 503):
+                log.warning("Ollama HTTP %d on attempt %d — retrying in %ds", r.status_code, attempt+1, wait)
+                _time.sleep(wait)
+                last_err = f"HTTP {r.status_code}"
+                continue
 
-    if isinstance(parsed, dict):
-        parsed = (
-            parsed.get("embedding")
-            or parsed.get("values")
-            or parsed.get("vector")
-            or list(parsed.values())[0]
-        )
+            r.raise_for_status()
+            raw = r.json().get("message", {}).get("content", "[]")
 
-    vec = [float(v) for v in parsed]
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                m = re.search(r'\[.*?\]', raw, re.DOTALL)
+                parsed = json.loads(m.group()) if m else []
 
-    # Pad or trim to exactly EMBED_DIM
-    if len(vec) < EMBED_DIM:
-        vec.extend([0.0] * (EMBED_DIM - len(vec)))
-    elif len(vec) > EMBED_DIM:
-        vec = vec[:EMBED_DIM]
+            if isinstance(parsed, dict):
+                parsed = (
+                    parsed.get("embedding")
+                    or parsed.get("values")
+                    or parsed.get("vector")
+                    or list(parsed.values())[0]
+                )
 
-    # L2-normalise
-    norm = sum(x * x for x in vec) ** 0.5
-    if norm > 0:
-        vec = [x / norm for x in vec]
+            vec = [float(v) for v in parsed]
 
-    return vec
+            if len(vec) == 0:
+                log.warning("Empty vector on attempt %d — retrying in %ds", attempt+1, wait)
+                _time.sleep(wait)
+                last_err = "empty vector"
+                continue
+
+            # Pad or trim to exactly EMBED_DIM
+            if len(vec) < EMBED_DIM:
+                vec.extend([0.0] * (EMBED_DIM - len(vec)))
+            elif len(vec) > EMBED_DIM:
+                vec = vec[:EMBED_DIM]
+
+            # L2-normalise
+            norm = sum(x * x for x in vec) ** 0.5
+            if norm > 0:
+                vec = [x / norm for x in vec]
+
+            return vec   # success
+
+        except RuntimeError:
+            raise   # 401/404 — don't retry, always fatal
+        except requests.Timeout:
+            log.warning("Ollama timeout on attempt %d — retrying in %ds", attempt+1, wait)
+            _time.sleep(wait)
+            last_err = "timeout"
+        except Exception as e:
+            log.warning("Ollama error on attempt %d: %s — retrying in %ds", attempt+1, e, wait)
+            _time.sleep(wait)
+            last_err = str(e)
+
+    raise RuntimeError(f"_embed_one failed after {retries} attempts: {last_err}")
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -196,10 +236,19 @@ def csv_to_chunks(df: pd.DataFrame, chunk_rows: int = 20) -> list[dict]:
 
 # ─────────────────── INGEST ───────────────────
 def upsert_chunks(chunks: list[dict], source_tag: str) -> int:
-    client = get_qdrant()
-    total  = 0
+    client  = get_qdrant()
+    total   = 0
+    skipped = 0
     for i, chunk in enumerate(chunks):
-        vec = _embed_one(chunk["text"])
+        try:
+            vec = _embed_one(chunk["text"])   # has built-in retry
+        except RuntimeError as e:
+            if "401" in str(e) or "not found" in str(e):
+                raise   # fatal — bubble up immediately
+            log.error("Skipping chunk %d/%d after retries: %s", i+1, len(chunks), e)
+            skipped += 1
+            continue    # skip this chunk, keep going
+
         uid = int(hashlib.md5(f"{source_tag}{i}".encode()).hexdigest(), 16) % (10**12)
         client.upsert(
             collection_name=COLLECTION_NAME,
@@ -210,7 +259,10 @@ def upsert_chunks(chunks: list[dict], source_tag: str) -> int:
             )],
         )
         total += 1
-        log.info("Embedded chunk %d/%d  [%s]", i + 1, len(chunks), source_tag)
+        log.info("Embedded chunk %d/%d  [%s] (skipped=%d)", i+1, len(chunks), source_tag, skipped)
+
+    if skipped:
+        log.warning("Ingest complete — %d chunks embedded, %d skipped due to errors", total, skipped)
     return total
 
 
