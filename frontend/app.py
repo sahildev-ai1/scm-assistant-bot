@@ -5,55 +5,19 @@ Tabs:
   1. 📤 Data Ingest  — upload CSV + PDF, show dataflow, chunk config
   2. 💬 Chat         — RAG chatbot with sample questions
   3. 📊 Dashboard    — quick stats from the status endpoint
+
+FIX: Removed broken localStorage/query-param bridge.
+     Chat history lives in st.session_state (persists across reruns within
+     a session). On hard-refresh it resets — that is normal Streamlit behaviour.
+     The old _inject_ls_loader() was causing a JS redirect loop that prevented
+     the /chat API call from ever firing.
 """
 
 import time
 import requests
 import streamlit as st
-import streamlit.components.v1 as _components
 import pandas as pd
-
-# ─────────────────── LOCALSTORAGE BRIDGE ───────────────────
 import json as _json
-
-# localStorage key
-_LS_KEY = "scm_chat_history"
-
-def _save_to_ls(messages: list):
-    """Write chat history to browser localStorage via injected JS."""
-    payload = _json.dumps(messages, ensure_ascii=True)
-    # Use single quotes around the JSON string so double-quotes inside don't break JS
-    js = f"try{{localStorage.setItem('{_LS_KEY}', JSON.stringify({payload}));}}catch(e){{}}"
-    _components.html(f"<script>{js}</script>", height=0)
-
-def _clear_ls():
-    """Remove chat history from localStorage."""
-    _components.html(
-        f"<script>try{{localStorage.removeItem('{_LS_KEY}');}}catch(e){{}}</script>",
-        height=0,
-    )
-
-def _inject_ls_loader():
-    """
-    On first render: read localStorage and push it into ?_hist= query param,
-    triggering a Streamlit reload that populates session_state.
-    Guard: skip if ?_hist already present (already loaded this session).
-    """
-    _components.html(f"""
-    <script>
-    (function(){{
-      if (new URLSearchParams(window.location.search).get('_hist')) return;
-      var raw = null;
-      try {{ raw = localStorage.getItem('{_LS_KEY}'); }} catch(e) {{}}
-      if (!raw) return;
-      var url = new URL(window.location.href);
-      url.searchParams.set('_hist', encodeURIComponent(raw));
-      window.location.replace(url.toString());
-    }})();
-    </script>
-    """, height=0)
-
-
 
 # ─────────────────── CONFIG ───────────────────
 API_BASE = "http://localhost:8000"   # FastAPI on same dyno
@@ -237,6 +201,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ─────────────────── SESSION STATE INIT ───────────────────
+# Initialize once per browser session — persists across all reruns.
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "pending_q" not in st.session_state:
+    st.session_state.pending_q = ""
+
+
 # ─────────────────── HELPERS ───────────────────
 def api_get(path: str):
     try:
@@ -247,7 +220,6 @@ def api_get(path: str):
         return None, str(e)
 
 def api_post(path: str, timeout: int = 300, **kwargs):
-    # /chat needs a long timeout — Ollama Cloud gemma4:31b can take 2-4 min
     try:
         r = requests.post(f"{API_BASE}{path}", timeout=timeout, **kwargs)
         r.raise_for_status()
@@ -472,23 +444,6 @@ with tab1:
 with tab2:
     st.markdown("## 💬 Supply Chain Chatbot")
 
-    # ── Load history from localStorage on first load ──
-    _inject_ls_loader()   # injects JS; on reload populates ?_hist= query param
-
-    if "messages" not in st.session_state:
-        # Try to restore from query param (set by the JS bridge above)
-        raw_hist = st.query_params.get("_hist", "")
-        if raw_hist:
-            try:
-                import urllib.parse as _up
-                st.session_state.messages = _json.loads(_up.unquote(raw_hist))
-                # Clean the URL so reloads don't re-inject
-                st.query_params.clear()
-            except Exception:
-                st.session_state.messages = []
-        else:
-            st.session_state.messages = []
-
     # Sample questions
     st.markdown("### 📋 Sample Questions")
     sample_qs = [
@@ -501,52 +456,63 @@ with tab2:
 
     cols = st.columns(3)
     for i, q in enumerate(sample_qs):
-        if cols[i % 3].button(f"Q{i+1}", key=f"sq_{i}", use_container_width=True,
-                              help=q):
+        if cols[i % 3].button(f"Q{i+1}", key=f"sq_{i}", use_container_width=True, help=q):
             st.session_state.pending_q = q
 
     st.markdown("---")
 
-    # Input FIRST — so the key is registered before we read session state below
-    question = st.text_input(
-        "Ask a question about your supply chain…",
-        value=st.session_state.pop("pending_q", ""),
-        key="chat_input",
-        placeholder="e.g. Which suppliers have active disruption flags?",
-    )
+    # ── Chat history display ──
+    chat_container = st.container()
+    with chat_container:
+        for msg in st.session_state.messages:
+            if msg["role"] == "user":
+                st.markdown(
+                    f'<div class="user-bubble">👤 <strong>You</strong><br>{msg["content"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="bot-bubble">🤖 <strong>SCM Assistant</strong><br>{msg["content"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                if msg.get("meta"):
+                    st.markdown(f'<div class="meta-tag">{msg["meta"]}</div>', unsafe_allow_html=True)
 
-    # Chat history — rendered after input so it always shows latest messages
-    for msg in st.session_state.messages:
-        if msg["role"] == "user":
-            st.markdown(f'<div class="user-bubble">👤 <strong>You</strong><br>{msg["content"]}</div>',
-                        unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="bot-bubble">🤖 <strong>SCM Assistant</strong><br>{msg["content"]}</div>',
-                        unsafe_allow_html=True)
-            if msg.get("meta"):
-                st.markdown(f'<div class="meta-tag">{msg["meta"]}</div>', unsafe_allow_html=True)
+    st.markdown("---")
 
-    col_send, col_clear = st.columns([4, 1])
-    send_btn  = col_send.button("Send ➤", key="send_btn")
-    clear_btn = col_clear.button("Clear", key="clear_btn")
+    # ── Input row ──
+    # Consume pending_q (set by sample question buttons) as the default value,
+    # then immediately clear it so the next rerun doesn't re-populate the box.
+    pending = st.session_state.pop("pending_q", "")
 
+    col_input, col_send, col_clear = st.columns([6, 1, 1])
+    with col_input:
+        question = st.text_input(
+            "Ask a question about your supply chain…",
+            value=pending,
+            key="chat_input",
+            placeholder="e.g. Which suppliers have active disruption flags?",
+            label_visibility="collapsed",
+        )
+    send_btn  = col_send.button("Send ➤",  key="send_btn",  use_container_width=True)
+    clear_btn = col_clear.button("Clear 🗑", key="clear_btn", use_container_width=True)
+
+    # ── Clear handler ──
     if clear_btn:
         st.session_state.messages = []
-        _clear_ls()
         st.rerun()
 
+    # ── Send handler ──
+    # Read directly from session_state widget key — always accurate, even on rerun.
     if send_btn:
-        # Always read from session_state — the local `question` variable is stale
-        # on re-run (st.text_input resets it to "" before this handler fires).
         question = st.session_state.get("chat_input", "").strip()
 
     if send_btn and question:
-        # Store question immediately, clear input via flag
+        # Append user message immediately
         st.session_state.messages.append({"role": "user", "content": question})
-        st.session_state["_last_q"] = question
 
-        # Show spinner and call API — do NOT rerun until after storing the answer
-        with st.spinner("⏳ Querying Ollama Cloud… (may take 30-90s for gemma4:31b)"):
+        # Call backend — do NOT st.rerun() before this finishes
+        with st.spinner("⏳ Querying Ollama Cloud… (may take 30–90 s for gemma4:31b)"):
             result, err = api_post("/chat", timeout=360, json={"question": question, "top_k": 6})
 
         if result:
@@ -561,9 +527,8 @@ with tab2:
                 "role": "assistant",
                 "content": f"⚠️ Error: {err}",
             })
-        # Persist to browser localStorage before rerun
-        _save_to_ls(st.session_state.messages)
-        # Only rerun AFTER answer is stored — this re-renders chat history
+
+        # Rerun AFTER answer is stored — re-renders the chat history above
         st.rerun()
 
 
